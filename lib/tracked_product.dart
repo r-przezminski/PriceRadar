@@ -1,3 +1,9 @@
+double? _safeDouble(dynamic v) {
+  if (v == null) return null;
+  if (v is num) return v.toDouble();
+  return double.tryParse(v.toString().replaceAll(',', '.').trim());
+}
+
 class StoreOffer {
   final String store;
   double price;
@@ -20,8 +26,8 @@ class StoreOffer {
   factory StoreOffer.fromJson(Map<String, dynamic> json) {
     return StoreOffer(
       store: (json['store'] ?? 'Sklep').toString(),
-      price: (json['price'] as num?)?.toDouble() ?? 0.0,
-      regularPrice: (json['regularPrice'] as num?)?.toDouble() ?? 0.0,
+      price: _safeDouble(json['price']) ?? 0.0,
+      regularPrice: _safeDouble(json['regularPrice']) ?? 0.0,
       isPromo: json['isPromo'] == true,
       url: (json['url'] ?? '').toString(),
       availability: (json['availability'] ?? 'Dostępny').toString(),
@@ -42,7 +48,7 @@ class StoreOffer {
 
 class ProductInfo {
   final String store;
-  final String category;
+  String category;
   final String url;
   final String brand;
   final String title;
@@ -93,9 +99,9 @@ class ProductInfo {
       fullName: (json['fullName'] ?? 'Produkt').toString(),
       unit: (json['unit'] ?? '').toString(),
       ean: json['ean']?.toString(),
-      currentPrice: (json['currentPrice'] as num?)?.toDouble() ?? 0.0,
-      regularPrice: (json['regularPrice'] as num?)?.toDouble() ?? 0.0,
-      lowestOmnibusPrice: (json['lowestOmnibusPrice'] as num?)?.toDouble(),
+      currentPrice: _safeDouble(json['currentPrice']) ?? 0.0,
+      regularPrice: _safeDouble(json['regularPrice']) ?? 0.0,
+      lowestOmnibusPrice: _safeDouble(json['lowestOmnibusPrice']),
       pricePerUnit: json['pricePerUnit']?.toString(),
       isPromo: json['isPromo'] == true,
       promotionTo: json['promotionTo']?.toString(),
@@ -134,10 +140,44 @@ class TrackedItem {
   ProductInfo product;
   List<StoreOffer> offers;
 
+  /// Własne tagi nadawane przez użytkownika (np. "Twarz", "Prezent").
+  List<String> tags;
+
   TrackedItem({
     required this.product,
     required this.offers,
-  });
+    List<String>? tags,
+  }) : tags = tags ?? <String>[];
+
+  static const String tagPromo = 'PROMOCJA';
+  static const String tagCheaperElsewhere = 'Taniej w innym sklepie';
+
+  /// Tagi automatyczne wyliczane z danych produktu.
+  List<String> get autoTags => [
+        if (product.category.trim().isNotEmpty) product.category.trim(),
+        if (product.isPromo) tagPromo,
+        if (cheaperInOtherStore) tagCheaperElsewhere,
+      ];
+
+  /// Wszystkie tagi (automatyczne + własne) bez duplikatów.
+  List<String> get allTags {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final t in [...autoTags, ...tags]) {
+      if (seen.add(t.toLowerCase())) out.add(t);
+    }
+    return out;
+  }
+
+  /// Sklepy, w których produkt ma ofertę (łącznie ze sklepem źródłowym).
+  Set<String> get stores {
+    final out = <String>{};
+    if (product.store.trim().isNotEmpty) out.add(product.store.trim());
+    for (final o in offers) {
+      if (o.store.trim().isNotEmpty) out.add(o.store.trim());
+    }
+    return out;
+  }
 
   StoreOffer get bestOffer => offers.isNotEmpty
       ? offers.first
@@ -161,11 +201,17 @@ class TrackedItem {
     final parsedOffers = rawOffers
         .map((e) => StoreOffer.fromJson(Map<String, dynamic>.from(e as Map)))
         .toList();
-    return TrackedItem(product: prod, offers: parsedOffers);
+    final rawTags = (json['tags'] as List?) ?? [];
+    final parsedTags = rawTags
+        .map((e) => e.toString().trim())
+        .where((e) => e.isNotEmpty)
+        .toList();
+    return TrackedItem(product: prod, offers: parsedOffers, tags: parsedTags);
   }
 
   Map<String, dynamic> toJson() => {
         'product': product.toJson(),
         'offers': offers.map((o) => o.toJson()).toList(),
+        'tags': tags,
       };
 }

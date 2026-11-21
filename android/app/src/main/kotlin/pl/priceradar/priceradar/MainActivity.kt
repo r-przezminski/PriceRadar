@@ -57,6 +57,41 @@ class MainActivity : FlutterActivity() {
     private val CHANNEL = "pl.priceradar.app/native"
     private val WORK_NAME = "PriceRadarPeriodicCheck"
     private var notifCounter = 3001
+    private var pendingSharedUrl: String? = null
+    private var nativeChannel: MethodChannel? = null
+
+    private fun extractUrlFromText(text: String?): String? {
+        if (text.isNullOrBlank()) return null
+        val matcher = Pattern.compile("https?://[a-zA-Z0-9\\-._~:/?#\\[\\]@!$&'()*+,;=%]+").matcher(text)
+        if (matcher.find()) {
+            var url = matcher.group()
+            while (url.endsWith(".") || url.endsWith(",") || url.endsWith(")") || url.endsWith("]") || url.endsWith(";")) {
+                url = url.substring(0, url.length - 1)
+            }
+            return url
+        }
+        return null
+    }
+
+    private fun handleSendIntent(intent: Intent?) {
+        if (intent?.action == Intent.ACTION_SEND && (intent.type?.startsWith("text/") == true || intent.type == null)) {
+            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)
+                ?: intent.getStringExtra(Intent.EXTRA_STREAM)?.toString()
+            val url = extractUrlFromText(sharedText)
+            if (url != null) {
+                pendingSharedUrl = url
+                Handler(Looper.getMainLooper()).postDelayed({
+                    nativeChannel?.invokeMethod("onSharedUrlReceived", url)
+                }, 300)
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleSendIntent(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         try {
@@ -65,6 +100,9 @@ class MainActivity : FlutterActivity() {
             }
         } catch (_: Throwable) {}
         super.onCreate(savedInstanceState)
+        try {
+            handleSendIntent(intent)
+        } catch (_: Throwable) {}
         try {
             createNotificationChannel()
         } catch (_: Throwable) {}
@@ -78,10 +116,16 @@ class MainActivity : FlutterActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
-            .setMethodCallHandler { call, result ->
-                val prefs = getSharedPreferences(PriceCheckWorker.PREFS_NAME, Context.MODE_PRIVATE)
-                when (call.method) {
+        val channel = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
+        nativeChannel = channel
+        channel.setMethodCallHandler { call, result ->
+            val prefs = getSharedPreferences(PriceCheckWorker.PREFS_NAME, Context.MODE_PRIVATE)
+            when (call.method) {
+                "getInitialSharedUrl" -> {
+                    val url = pendingSharedUrl
+                    pendingSharedUrl = null
+                    result.success(url)
+                }
                     "getTrackedJson" -> {
                         val json = prefs.getString(PriceCheckWorker.KEY_TRACKED_JSON, "") ?: ""
                         result.success(json)
@@ -326,8 +370,31 @@ object OffscreenWebViewCapturer {
                                     var mp = document.querySelector('meta[property="product:price:amount"], meta[property="og:price:amount"], [itemprop="price"]');
                                     if (mp) metaPrice = mp.getAttribute('content') || mp.innerText || '';
                                     var ogImg = '';
-                                    var mi = document.querySelector('meta[property="og:image"]');
+                                    var mi = document.querySelector('meta[property="og:image"], meta[name="twitter:image"]');
                                     if (mi) ogImg = mi.getAttribute('content') || '';
+                                    if (!ogImg || ogImg.indexOf('logo') !== -1) {
+                                        var bestImg = '';
+                                        var bestArea = 0;
+                                        var imgs = document.querySelectorAll('img');
+                                        for (var k = 0; k < imgs.length; k++) {
+                                            var src = imgs[k].currentSrc || imgs[k].getAttribute('src') || imgs[k].getAttribute('data-src') || '';
+                                            if (src.indexOf('//') === 0) src = 'https:' + src;
+                                            if (src.indexOf('http') !== 0) continue;
+                                            if (src.indexOf('logo') !== -1 || src.indexOf('icon') !== -1 || src.indexOf('sprite') !== -1) continue;
+                                            var w = imgs[k].naturalWidth || imgs[k].width || 0;
+                                            var h = imgs[k].naturalHeight || imgs[k].height || 0;
+                                            var area = w * h;
+                                            if (src.indexOf('allegroimg.com') !== -1 && area >= 10000) {
+                                                bestImg = src;
+                                                break;
+                                            }
+                                            if (w >= 140 && h >= 140 && area > bestArea) {
+                                                bestArea = area;
+                                                bestImg = src;
+                                            }
+                                        }
+                                        if (bestImg) ogImg = bestImg;
+                                    }
                                     var bodyText = document.body ? document.body.innerText.substring(0, 12000) : '';
                                     var fullHtml = document.documentElement ? document.documentElement.outerHTML.substring(0, 160000) : '';
                                     return JSON.stringify({

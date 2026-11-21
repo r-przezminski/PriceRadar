@@ -121,10 +121,64 @@ class ScraperService {
     return null;
   }
 
+  static const Set<String> _storeNameTokens = {
+    'rossmann', 'natura', 'drogerie natura', 'hebe', 'cocolita', 'ezebra',
+    'notino', 'superpharm', 'super pharm', 'pachnij', 'melissa', 'apteka melissa',
+    'sklep', 'produkt'
+  };
+
+  static const Set<String> _genericWords = {
+    'krem', 'zel', 'plyn', 'serum', 'balsam', 'szampon', 'odzywka', 'maska',
+    'tonik', 'olejek', 'pianka', 'emulsja', 'woda', 'perfumy', 'twarzy',
+    'ciala', 'skory', 'wlosow', 'oczu', 'rak', 'dloni', 'stop', 'suchej',
+    'normalnej', 'mieszanej', 'wrazliwej', 'tlustej', 'do', 'dla', 'ze',
+    'bez', 'oraz', 'lub', 'pod', 'nad', 'przy', 'spf', 'uva', 'uvb',
+    'ml', 'szt', 'g', 'kg', 'l', 'opakowanie', 'nowosc', 'promocja',
+    'rossmann', 'natura', 'hebe', 'cocolita', 'ezebra', 'notino',
+  };
+
+  /// Kontrola poczytalności dla dopasowania po EAN: marka, pojemność oraz
+  /// (gdy nie znamy prawdziwej marki) przynajmniej jedno słowo modelu.
+  static bool _isNameCompatibleForEanMatch(ProductInfo base, ProductInfo cand) {
+    final normBaseBrand = _normalizeText(base.brand);
+    final normCandBrand = _normalizeText(cand.brand);
+    final normCandFull = _normalizeText('${cand.brand} ${cand.fullName}');
+    final candWords = normCandFull.split(' ').toSet();
+
+    final isRealBrand =
+        normBaseBrand.isNotEmpty && !_storeNameTokens.contains(normBaseBrand);
+    if (isRealBrand) {
+      final brandWords = normBaseBrand
+          .split(' ')
+          .where((w) => w.length >= 2 && !_storeNameTokens.contains(w))
+          .toList();
+      if (brandWords.isNotEmpty &&
+          !brandWords.any((bw) => normCandFull.contains(bw) || normCandBrand.contains(bw))) {
+        return false;
+      }
+    }
+
+    final baseCap = _extractCapacity(base.fullName, base.unit);
+    final candCap = _extractCapacity(cand.fullName, cand.unit);
+    if (baseCap != null && candCap != null && baseCap != candCap) return false;
+
+    if (!isRealBrand) {
+      final modelWords = _normalizeText(base.fullName)
+          .split(' ')
+          .where((w) => w.length >= 3 && !_genericWords.contains(w))
+          .toSet();
+      if (modelWords.isNotEmpty &&
+          !modelWords.any((w) => candWords.contains(w) || normCandFull.contains(w))) {
+        return false;
+      }
+    }
+    return true;
+  }
+
   /**
    * Rygorystyczna weryfikacja, czy znaleziony w innym sklepie produkt (`candidate`)
-   * to faktycznie ten sam produkt co `baseProduct` (chroni przed "bestsellerami" typu Plusssz Magnez
-   * zwracanymi przez sklepy, gdy szukany produkt nie istnieje w ich bazie).
+   * to faktycznie ten sam produkt co `baseProduct` (chroni przed odwoływaniem się do innego produktu
+   * z tej samej marki lub losowych produktów polecanych przez wyszukiwarkę sklepu).
    */
   static bool isSameProduct({
     required ProductInfo baseProduct,
@@ -132,74 +186,111 @@ class ScraperService {
     String? searchedEan,
     String candidateHtml = '',
   }) {
-    // 1. Jeśli oba produkty mają wykryty, prawidłowy kod EAN-13:
-    if (searchedEan != null &&
-        isValidEan13(searchedEan) &&
-        candidate.ean != null &&
-        isValidEan13(candidate.ean)) {
-      return searchedEan == candidate.ean;
+    final candEan = candidate.ean;
+
+    // 1. Jeśli szukaliśmy po konkretnym kodzie EAN-13:
+    if (searchedEan != null && isValidEan13(searchedEan)) {
+      var eanConfirmed = false;
+      if (candEan != null && isValidEan13(candEan)) {
+        // Jeśli kandydat ma zidentyfikowany EAN, musi być identyczny!
+        if (searchedEan != candEan) return false;
+        eanConfirmed = true;
+      } else if (RegExp('(?<![0-9])$searchedEan(?![0-9])').hasMatch(candidateHtml)) {
+        // Kandydat nie ma wprost przypisanego EAN, ale jego HTML zawiera szukany kod.
+        eanConfirmed = true;
+      }
+      // Szukaliśmy po EAN i nie występuje on na stronie kandydata (np. losowy
+      // "bestseller" z wyników wyszukiwania) -> odrzucamy.
+      if (!eanConfirmed) return false;
+
+      // Sam EAN NIE wystarcza: kod odczytany ze strony bywa błędny (np. EAN produktu
+      // z karuzeli "Polecane" zamiast głównego produktu). Dlatego zgodny EAN musi
+      // iść w parze z zgodną marką / pojemnością / nazwą.
+      return _isNameCompatibleForEanMatch(baseProduct, candidate);
     }
 
-    // 2. Jeśli szukaliśmy po konkretnym kodzie EAN i kod ten fizycznie znajduje się w kodzie produktu kandydata:
-    final eanMatchedInHtml = searchedEan != null &&
-        isValidEan13(searchedEan) &&
-        RegExp('(?<![0-9])$searchedEan(?![0-9])').hasMatch(candidateHtml);
+    // 2. Jeśli nie mamy EAN lub sprawdzamy dopasowanie po nazwie:
+    final normBaseBrand = _normalizeText(baseProduct.brand);
+    final normCandBrand = _normalizeText(candidate.brand);
+    final normCandFull = _normalizeText('${candidate.brand} ${candidate.fullName}');
 
-    // 3. Sprawdzamy zgodność marki oraz słów kluczowych nazwy (nawet gdy sklep wyświetlił listę pod zapytaniem EAN!)
+    const storeNames = {
+      'rossmann', 'natura', 'drogerie natura', 'hebe', 'cocolita', 'ezebra',
+      'notino', 'superpharm', 'super pharm', 'pachnij', 'melissa', 'apteka melissa',
+      'sklep', 'produkt'
+    };
+
+    // A) Weryfikacja marki:
+    final isRealBrand = normBaseBrand.isNotEmpty && !storeNames.contains(normBaseBrand);
+    if (isRealBrand) {
+      final baseBrandWords = normBaseBrand
+          .split(' ')
+          .where((w) => w.length >= 2 && !storeNames.contains(w))
+          .toList();
+
+      if (baseBrandWords.isNotEmpty) {
+        // Kandydat MUSI zawierać główne słowo marki w nazwie lub marce
+        final brandMatches = baseBrandWords.where((bw) => normCandFull.contains(bw) || normCandBrand.contains(bw)).length;
+        if (brandMatches == 0) {
+          return false;
+        }
+      }
+    }
+
+    // B) Sprawdzamy pojemność (np. 50ml vs 400ml)
+    final baseCap = _extractCapacity(baseProduct.fullName, baseProduct.unit);
+    final candCap = _extractCapacity(candidate.fullName, candidate.unit);
+    if (baseCap != null && candCap != null && baseCap != candCap) {
+      return false;
+    }
+
+    // C) Słowa kluczowe MODELU / WARIANTU (z wykluczeniem marki i słów ogólnych!):
     const stopWords = {
       'krem', 'zel', 'plyn', 'serum', 'balsam', 'szampon', 'odzywka', 'maska',
       'tonik', 'olejek', 'pianka', 'emulsja', 'woda', 'perfumy', 'twarzy',
       'ciala', 'skory', 'wlosow', 'oczu', 'rak', 'dloni', 'stop', 'suchej',
       'normalnej', 'mieszanej', 'wrazliwej', 'tlustej', 'do', 'dla', 'ze',
       'bez', 'oraz', 'lub', 'pod', 'nad', 'przy', 'spf', 'uva', 'uvb',
-      'ml', 'szt', 'rossmann', 'natura', 'hebe', 'cocolita', 'ezebra',
+      'ml', 'szt', 'g', 'kg', 'l', 'opakowanie', 'nowosc', 'promocja',
+      'rossmann', 'natura', 'hebe', 'cocolita', 'ezebra', 'notino',
     };
 
-    final baseBrandWords = _normalizeText(baseProduct.brand)
-        .split(' ')
-        .where((w) => w.length >= 2 && !stopWords.contains(w))
-        .toList();
+    final brandWordsSet = normBaseBrand.split(' ').toSet();
 
-    final baseAllWords = _normalizeText('${baseProduct.brand} ${baseProduct.title}')
+    // Słowa modelu to słowa z nazwy bazowej, które NIE są marką ani słowami pospolitymi:
+    final baseModelWords = _normalizeText(baseProduct.fullName)
         .split(' ')
-        .where((w) => w.length >= 3 && !stopWords.contains(w))
+        .where((w) => w.length >= 3 && !stopWords.contains(w) && !brandWordsSet.contains(w))
         .toSet();
 
-    final candNorm = _normalizeText('${candidate.brand} ${candidate.fullName}');
-    final candWords = candNorm.split(' ').toSet();
+    final candWords = normCandFull.split(' ').toSet();
 
-    // Jeżeli znamy markę produktu bazowego (np. "Beauty of Joseon", "Garnier", "CeraVe"),
-    // to kandydat MUSI zawierać główne słowo marki!
-    if (baseBrandWords.isNotEmpty) {
-      final brandMatches = baseBrandWords.where((bw) => candNorm.contains(bw)).length;
-      if (brandMatches == 0 && !eanMatchedInHtml) {
+    // Jeśli produkt bazowy ma unikalne słowa modelu (np. "relief", "rice", "probiotics"):
+    if (baseModelWords.isNotEmpty) {
+      int matchedModelWords = 0;
+      for (final w in baseModelWords) {
+        if (candWords.contains(w) || normCandFull.contains(w)) {
+          matchedModelWords++;
+        }
+      }
+      final ratio = matchedModelWords / baseModelWords.length;
+      final minRequired = baseModelWords.length == 1 ? 1 : 2;
+      if (matchedModelWords < minRequired || ratio < 0.60) {
         return false;
       }
     }
 
-    // Sprawdzamy pojemność (np. 50ml vs 400ml) - jeśli oba mają podaną pojemność i jest różna, odrzucamy!
-    final baseCap = _extractCapacity(baseProduct.fullName, baseProduct.unit);
-    final candCap = _extractCapacity(candidate.fullName, candidate.unit);
-    if (baseCap != null && candCap != null && baseCap != candCap && !eanMatchedInHtml) {
-      return false;
-    }
-
-    if (eanMatchedInHtml) {
-      return true;
-    }
-
-    if (baseAllWords.isEmpty) return false;
-
-    int matchedKeywords = 0;
-    for (final w in baseAllWords) {
-      if (candWords.contains(w) || candNorm.contains(w)) {
-        matchedKeywords++;
+    // D) Sprawdzamy specyficzne numery w nazwie (np. "50", "30", "15", "01"):
+    final baseNumbers = RegExp(r'\b\d+\b').allMatches(baseProduct.fullName).map((m) => m.group(0)!).toSet();
+    final candNumbers = RegExp(r'\b\d+\b').allMatches(candidate.fullName).map((m) => m.group(0)!).toSet();
+    if (baseNumbers.isNotEmpty && candNumbers.isNotEmpty) {
+      final commonNumbers = baseNumbers.intersection(candNumbers);
+      if (commonNumbers.isEmpty) {
+        return false;
       }
     }
 
-    final ratio = matchedKeywords / baseAllWords.length;
-    // Wymagamy co najmniej 50% pokrycia unikalnych słów kluczowych (i minimum 2 wspólnych słów kluczowych)
-    return matchedKeywords >= 2 && ratio >= 0.50;
+    return true;
   }
 
   static Map<String, String> detectStore(String urlStr) {
@@ -239,6 +330,130 @@ class ScraperService {
     }
   }
 
+  /// Wykrywa dokładną kategorię na podstawie nazwy produktu, URL i kategorii z JSON-LD,
+  /// zamiast ślepo przypisywać kategorię sklepu (np. kawa z morele.net -> "Kawa i herbata", a nie "Elektronika").
+  static String detectSmartCategory({
+    required String fullName,
+    required String url,
+    required String storeFallbackCategory,
+    String? rawLdCategory,
+  }) {
+    final text = _normalizeText('$fullName ${rawLdCategory ?? ''} ${Uri.decodeFull(url)}');
+
+    bool hasAny(List<String> patterns) {
+      for (final p in patterns) {
+        if (RegExp(p, caseSensitive: false).hasMatch(text)) return true;
+      }
+      return false;
+    }
+
+    // 1. AGD / Elektronika (sprawdzane przed kawą, żeby "ekspres do kawy" lub "młynek do kawy" nie trafił do "Kawa i herbata")
+    if (hasAny([
+      r'\bekspres\b', r'\bmlynek\b', r'\bspieniacz\b', r'\bczajnik\b',
+      r'\bsmartfon', r'\biphone\b', r'\bgalaxy\s*s\d', r'\blaptop', r'\bnotebook',
+      r'\bmonitor\b', r'\bsluchawk', r'\bklawiatur', r'\bmyszk[ai]\b', r'\bprocesor\b',
+      r'\bkarta\s*graficzn', r'\bdysk\s*ssd\b', r'\bpamiec\s*ram\b', r'\btablet\b',
+      r'\bsmartwatch', r'\btelewizor', r'\bglosnik', r'\bpowerbank', r'\bladowark',
+      r'\brouter\b', r'\bdrukark', r'\bkonsol[ae]\b', r'\bodkurzacz', r'\bairfryer',
+      r'\bfrytkownic', r'\bsuszark[ai]\s*do\s*wlosow', r'\bprostownic',
+      r'\bszczoteczk[ai]\s*(?:soniczn|elektryczn)', r'\bgolark', r'\bdepilator',
+    ])) {
+      return 'Elektronika';
+    }
+
+    // 2. Kawa i herbata
+    if (hasAny([
+      r'\bkaw[ayeu]\b', r'\bziarnist', r'\bmielon[ae]\b', r'\bespresso\b',
+      r'\blavazza\b', r'\bjacobs\b', r'\btchibo\b', r'\bdallmayr\b', r'\bsegafredo\b',
+      r'\bkimbo\b', r'\billy\b', r'\bnescafe\b', r'\bdolce\s*gusto\b', r'\bnespresso\b',
+      r'\bherbat[ayeu]\b', r'\bmatch[ay]\b', r'\byerba\b', r'\brooibos\b',
+    ])) {
+      return 'Kawa i herbata';
+    }
+
+    // 3. Perfumy
+    if (hasAny([
+      r'\bwoda\s*perfumowan', r'\bwoda\s*toaletow', r'\bperfum[ay]?\b',
+      r'\bedp\b', r'\bedt\b', r'\bmgielk[ai]\s*zapach',
+    ])) {
+      return 'Perfumy';
+    }
+
+    // 4. Suplementy i zdrowie
+    if (hasAny([
+      r'\bwitamin', r'\bmagnez', r'\bomega\s*3', r'\bkolagen', r'\bsuplement',
+      r'\bprobiotyk', r'\belektrolit', r'\bkreatyn', r'\bbialk[oa]\b', r'\bwhey\b',
+      r'\bashwagandh', r'\bcynk\b', r'\bzelazo\b', r'\bmelatonin', r'\btran\b',
+      r'\bkapsulk[ai]\b', r'\btabletk[ai]\b',
+    ])) {
+      return 'Suplementy';
+    }
+
+    // 5. Kosmetyki i pielęgnacja
+    if (hasAny([
+      r'\bkrem\b', r'\bbalsam', r'\bserum\b', r'\btonik\b', r'\bszampon',
+      r'\bodzywk[ai]\b', r'\bmask[ai]\b', r'\bmaseczk', r'\bpeeling', r'\bspf\s*\d',
+      r'\bsamoopal', r'\bbrazujac', r'\bolejek\b', r'\bmicelarn', r'\bpiank[ai]\b',
+      r'\bzel\s*(?:do\s*mycia|pod\s*prysznic|do\s*twarzy)', r'\bpomadk', r'\btusz\s*do\s*rzes',
+      r'\bpodklad\b', r'\bpuder\b', r'\bkorektor\b', r'\bmakijaz', r'\blakier\s*do\s*paznokci',
+      r'\bdezodorant', r'\bantyperspirant', r'\bpasta\s*do\s*zebow', r'\bkosmetyk',
+    ])) {
+      return 'Kosmetyki';
+    }
+
+    // 6. Spożywcze
+    if (hasAny([
+      r'\bczekolad', r'\bbaton\b', r'\borzech', r'\bmiod\b', r'\boliwa\b',
+      r'\bolej\s*kokos', r'\bplatki\b', r'\bmakaron', r'\bsos\b', r'\bprzypraw',
+      r'\bsyrop\b', r'\bsok\b', r'\bnapoj', r'\bzywnosc', r'\bspozywcz', r'\bslodycz',
+      r'\bmaslo\s*orzechow', r'\bkrem\s*orzechow',
+    ])) {
+      return 'Spożywcze';
+    }
+
+    // 7. Chemia i dom
+    if (hasAny([
+      r'\bproszek\s*do\s*prania', r'\bkapsulk[ai]\s*do\s*prania', r'\bplyn\s*do\s*plukania',
+      r'\bplyn\s*do\s*naczyn', r'\btabletk[ai]\s*do\s*zmywarki', r'\bodswiezacz',
+      r'\bpapier\s*toaletow', r'\brecznik\s*papierow', r'\bswiec[ae]\b', r'\bdyfuzor',
+      r'\bpatelni', r'\bgarnek\b', r'\bkubek\b', r'\btermos\b', r'\bposciel',
+    ])) {
+      return 'Chemia i dom';
+    }
+
+    // 8. Dla zwierząt
+    if (hasAny([
+      r'\bkarma\s*dla', r'\bprzysmak\s*dla', r'\bzwirek\b', r'\bdla\s*psa\b', r'\bdla\s*kota\b',
+    ])) {
+      return 'Dla zwierząt';
+    }
+
+    // 9. Dla dzieci
+    if (hasAny([
+      r'\bpieluch', r'\bpieluszk', r'\bpampers', r'\bmleko\s*modyfikowan',
+      r'\bsmoczek', r'\bzabawk', r'\bklocki\b', r'\blego\b',
+    ])) {
+      return 'Dla dzieci';
+    }
+
+    // 10. Sport i turystyka
+    if (hasAny([
+      r'\brower\b', r'\bhantle\b', r'\bmata\s*do\s*cwiczen', r'\bnamiot\b',
+      r'\bspiwor\b', r'\bplecak\b', r'\bbidon\b',
+    ])) {
+      return 'Sport';
+    }
+
+    // 11. Książki i gry
+    if (hasAny([
+      r'\bksiazk', r'\bebook\b', r'\baudiobook', r'\bwinyl\b', r'\bgra\s*planszow', r'\bpuzzle\b',
+    ])) {
+      return 'Książki i gry';
+    }
+
+    return storeFallbackCategory;
+  }
+
   static Map<String, dynamic>? _findProductInJsonLd(dynamic obj) {
     if (obj == null) return null;
     if (obj is List) {
@@ -276,7 +491,7 @@ class ScraperService {
     if (!forceAgent) {
       try {
         final html = await _fetchHtml(url);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: html,
           url: url,
           storeInfo: storeInfo,
@@ -302,15 +517,21 @@ class ScraperService {
       final wvText = (wvData['innerText'] ?? '').toString();
       final wvTitle = (wvData['title'] ?? '').toString();
       final wvOgImage = (wvData['ogImage'] ?? '').toString();
+      final wvJsonLdList = (wvData['jsonLdList'] as List?)
+              ?.map((e) => e.toString())
+              .where((e) => e.trim().isNotEmpty)
+              .toList() ??
+          const <String>[];
       final screenshotB64 = (wvData['screenshotBase64'] ?? '').toString();
 
-      final domParsed = _parseHtmlDocument(
+      final domParsed = parseHtmlDocument(
         html: wvHtml,
         url: url,
         storeInfo: storeInfo,
         fallbackText: wvText,
         fallbackTitle: wvTitle,
         fallbackImage: wvOgImage,
+        extraJsonLd: wvJsonLdList,
         extractionMethod: '🌐 WebView (Screen + DOM)',
         screenshotBase64: screenshotB64.isNotEmpty ? screenshotB64 : null,
       );
@@ -395,7 +616,7 @@ class ScraperService {
       for (final m in matches) {
         final rossUrl = 'https://www.rossmann.pl${m.group(0)}';
         final rossProdHtml = await _fetchHtml(rossUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: rossProdHtml,
           url: rossUrl,
           storeInfo: {'name': 'Rossmann', 'category': 'Drogeria'},
@@ -452,6 +673,17 @@ class ScraperService {
     return null;
   }
 
+  static double? _parsePrice(dynamic value) {
+    if (value == null) return null;
+    if (value is num) return value.toDouble();
+    final cleaned = value
+        .toString()
+        .replaceAll(',', '.')
+        .replaceAll(RegExp(r'[^\d.]'), '');
+    if (cleaned.isEmpty) return null;
+    return double.tryParse(cleaned);
+  }
+
   static Future<ProductInfo?> _analyzeWithGeminiAgent({
     required String apiKey,
     required String url,
@@ -484,6 +716,13 @@ Wyciągnij ze zrzutu ekranu oraz tekstu strony informacje o produkcie i zwróć 
   "lowestOmnibusPrice": null,
   "pricePerUnit": "cena za 100ml/1l/1kg jeśli podana lub null"
 }
+
+ZASADY DOTYCZĄCE CEN:
+- "currentPrice": DOKŁADNA aktualna cena zakupu produktu, jaką klient płaci dzisiaj.
+  BARDZO WAŻNE: Jeśli produkt jest w promocji (widoczna niższa cena, przekreślona stara cena lub cena promocyjna/klubowa), wpisz tę NIŻSZĄ CENĘ ZAKUPU (np. 29.99).
+  NIGDY nie wpisuj tu ceny jednostkowej (np. "49,44 zł /100ml", "cena za 100ml/1l/1kg"), rekomendowanej ceny dostawcy, progu darmowej dostawy (np. 199.00), kuponu powitalnego / rabatu za newsletter (np. 10.00 / 20.00) ani rat.
+- "regularPrice": cena regularna / wyjściowa (przekreślona) przed rabatem. Jeśli produkt nie jest przeceniony, wpisz taką samą jak currentPrice.
+- "lowestOmnibusPrice": najniższa cena z ostatnich 30 dni przed wprowadzeniem obniżki (dyrektywa Omnibus) jeśli jest podana na karcie produktu (często małym drukiem), w przeciwnym razie null.
 
 Tekst strony:
 ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
@@ -526,18 +765,12 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       if (textJson == null || textJson.isEmpty) return null;
 
       final aiData = Map<String, dynamic>.from(jsonDecode(textJson) as Map);
-      final price = (aiData['currentPrice'] as num?)?.toDouble() ??
-          double.tryParse((aiData['currentPrice'] ?? '').toString().replaceAll(',', '.')) ??
-          0.0;
+      final price = _parsePrice(aiData['currentPrice']) ?? 0.0;
 
       if (price <= 0) return null;
 
-      final regPrice = (aiData['regularPrice'] as num?)?.toDouble() ??
-          double.tryParse((aiData['regularPrice'] ?? '').toString().replaceAll(',', '.')) ??
-          price;
-
-      final omnibus = (aiData['lowestOmnibusPrice'] as num?)?.toDouble() ??
-          double.tryParse((aiData['lowestOmnibusPrice'] ?? '').toString().replaceAll(',', '.'));
+      final regPrice = _parsePrice(aiData['regularPrice']) ?? price;
+      final omnibus = _parsePrice(aiData['lowestOmnibusPrice']);
 
       final brand = (aiData['brand'] ?? domHint?.brand ?? storeInfo['name'] ?? '').toString().trim();
       final title = (aiData['title'] ?? domHint?.title ?? pageTitle).toString().trim();
@@ -554,13 +787,20 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       final aiEan = aiData['ean']?.toString().trim();
       final validEan = isValidEan13(aiEan) ? aiEan : domHint?.ean;
 
+      final cleanFullName = fullName.replaceAll(RegExp(r'\s+'), ' ').trim();
+      final smartCategory = detectSmartCategory(
+        fullName: cleanFullName,
+        url: url,
+        storeFallbackCategory: storeInfo['category'] ?? 'Sklep',
+      );
+
       return ProductInfo(
         store: storeInfo['name'] ?? 'Sklep',
-        category: storeInfo['category'] ?? 'Sklep',
+        category: smartCategory,
         url: url,
         brand: brand.isEmpty ? (storeInfo['name'] ?? 'Sklep') : brand,
         title: title,
-        fullName: fullName.replaceAll(RegExp(r'\s+'), ' ').trim(),
+        fullName: cleanFullName,
         unit: unit,
         ean: validEan,
         currentPrice: price,
@@ -580,32 +820,46 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
     }
   }
 
-  static ProductInfo? _parseHtmlDocument({
+  static ProductInfo? parseHtmlDocument({
     required String html,
     required String url,
     required Map<String, String> storeInfo,
     String fallbackText = '',
     String fallbackTitle = '',
     String fallbackImage = '',
+    List<String> extraJsonLd = const [],
     required String extractionMethod,
     String? screenshotBase64,
   }) {
-    if (html.isEmpty && fallbackText.isEmpty) return null;
+    if (html.isEmpty && fallbackText.isEmpty && extraJsonLd.isEmpty) return null;
 
     Map<String, dynamic>? jsonLdProduct;
-    final ldRegex = RegExp(
-      r'<script[^>]*type=["\x27]application/ld\+json["\x27][^>]*>([\s\S]*?)</script>',
-      caseSensitive: false,
-    );
-    for (final m in ldRegex.allMatches(html)) {
+    for (final rawLd in extraJsonLd) {
       try {
-        final parsed = jsonDecode((m.group(1) ?? '').trim());
+        final parsed = jsonDecode(rawLd.trim());
         final found = _findProductInJsonLd(parsed);
         if (found != null) {
           jsonLdProduct = found;
           break;
         }
       } catch (_) {}
+    }
+
+    if (jsonLdProduct == null && html.isNotEmpty) {
+      final ldRegex = RegExp(
+        r'<script[^>]*type=["\x27]application/ld\+json["\x27][^>]*>([\s\S]*?)</script>',
+        caseSensitive: false,
+      );
+      for (final m in ldRegex.allMatches(html)) {
+        try {
+          final parsed = jsonDecode((m.group(1) ?? '').trim());
+          final found = _findProductInJsonLd(parsed);
+          if (found != null) {
+            jsonLdProduct = found;
+            break;
+          }
+        } catch (_) {}
+      }
     }
 
     String? getMeta(String prop) {
@@ -651,15 +905,24 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
     }
 
     String brand = '';
+    final rawLdBrand = jsonLdProduct?['brand'];
     if (nextProduct?['brand'] != null) {
       brand = nextProduct!['brand'].toString();
-    } else if (jsonLdProduct?['brand'] is String) {
-      brand = jsonLdProduct!['brand'].toString();
-    } else if (jsonLdProduct?['brand'] is Map) {
-      brand = (jsonLdProduct!['brand']['name'] ?? '').toString();
+    } else if (rawLdBrand is String) {
+      brand = rawLdBrand;
+    } else if (rawLdBrand is Map) {
+      brand = (rawLdBrand['name'] ?? '').toString();
+    } else if (rawLdBrand is List && rawLdBrand.isNotEmpty) {
+      final first = rawLdBrand.first;
+      if (first is Map) {
+        brand = (first['name'] ?? '').toString();
+      } else if (first != null) {
+        brand = first.toString();
+      }
     } else {
       brand = getMeta('product:brand') ?? getItemprop('brand') ?? '';
     }
+    brand = brand.trim();
 
     final rossParts = [
       nextProduct?['name']?.toString(),
@@ -678,17 +941,29 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
             htmlTitleMatch ??
             (fallbackTitle.isNotEmpty ? fallbackTitle : 'Produkt'));
 
+    // Hebe i część sklepów umieszcza typ produktu i pojemność w disambiguatingDescription
+    // (np. name="Mokosh Pomarańcza z cynamonem", disambiguatingDescription="brązujący balsam do ciała i twarzy, 180 ml")
+    final disamb = (jsonLdProduct?['disambiguatingDescription'] ?? '').toString().trim();
+    if (disamb.isNotEmpty &&
+        !rawTitle.toLowerCase().contains(disamb.toLowerCase())) {
+      rawTitle = '$rawTitle $disamb';
+    }
+
     // Usuń śmieciowe dopiski sklepów z tytułu (np. " | Drogeria Hebe.pl", " - Sklep Cocolita.pl")
     rawTitle = rawTitle
         .replaceAll(RegExp(r'\s*[|\-–]\s*(?:Drogeria|Sklep|Apteka)?\s*(?:Hebe|Rossmann|Natura|Cocolita|eZebra|Notino|Super-Pharm).*$', caseSensitive: false), '')
         .trim();
 
-    final unit = (nextProduct?['unit'] ?? '').toString();
+    var unit = (nextProduct?['unit'] ?? '').toString().trim();
+    if (unit.isEmpty) {
+      unit = _extractCapacity(rawTitle, '') ?? '';
+    }
     String fullName = rawTitle;
     if (brand.isNotEmpty && !rawTitle.toLowerCase().startsWith(brand.toLowerCase())) {
       fullName = '$brand $rawTitle';
     }
-    if (unit.isNotEmpty && !fullName.contains(unit)) {
+    if (unit.isNotEmpty &&
+        !fullName.toLowerCase().replaceAll(' ', '').contains(unit.toLowerCase().replaceAll(' ', ''))) {
       fullName = '$fullName ($unit)';
     }
     fullName = fullName.replaceAll(RegExp(r'\s+'), ' ').trim();
@@ -714,78 +989,179 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
     }
     ean ??= extractVerifiedEanFromContent(url, html, fallbackText);
 
-    dynamic rawPrice = nextProduct?['price'] ??
-        offer?['price'] ??
-        offer?['lowPrice'] ??
-        getMeta('product:price:amount') ??
-        getMeta('og:price:amount') ??
-        getItemprop('price');
+    double? detectedCurrentPrice;
+    double? detectedRegularPrice;
+    double? detectedOmnibusPrice;
 
-    if (rawPrice == null && fallbackText.isNotEmpty) {
-      final textPriceMatch = RegExp(r'(\d{1,5}[,.]\d{2})\s*(?:zł|PLN)').firstMatch(fallbackText);
-      if (textPriceMatch != null) {
-        rawPrice = textPriceMatch.group(1);
+    // 1. Z Next.js (__NEXT_DATA__) np. Rossmann
+    if (nextProduct != null) {
+      final npPrice = _parsePrice(nextProduct['price']);
+      final npOld = _parsePrice(nextProduct['oldPrice']);
+      final npOmni = _parsePrice(nextProduct['lastLowestPriceV2']);
+
+      if (npPrice != null && npPrice > 0) detectedCurrentPrice = npPrice;
+      if (npOld != null && npOld > 0) detectedRegularPrice = npOld;
+      if (npOmni != null && npOmni > 0) detectedOmnibusPrice = npOmni;
+    }
+
+    // 2. Z JSON-LD / schema.org offers & priceSpecification (obsługuje List oraz Map)
+    void inspectPriceSpec(dynamic spec) {
+      if (spec == null) return;
+      if (spec is List) {
+        for (final item in spec) {
+          inspectPriceSpec(item);
+        }
+        return;
+      }
+      if (spec is Map) {
+        final p = _parsePrice(spec['price']);
+        if (p == null || p <= 0) return;
+        final pType = (spec['priceType'] ?? '').toString().toLowerCase();
+
+        if (pType.contains('strikethrough') || pType.contains('listprice') || pType.contains('regular') || pType.contains('original')) {
+          detectedRegularPrice = p;
+        } else if (pType.contains('saleprice') || pType.contains('special') || pType.contains('promo')) {
+          detectedCurrentPrice = p;
+        } else if (pType.contains('minimumadvertised') || pType.contains('lowest') || pType.contains('30day') || pType.contains('omnibus')) {
+          detectedOmnibusPrice = p;
+        }
       }
     }
 
-    final cleanedPriceStr = (rawPrice ?? '')
-        .toString()
-        .replaceAll(',', '.')
-        .replaceAll(RegExp(r'[^\d.]'), '');
-    final currentPrice = double.tryParse(cleanedPriceStr) ?? 0.0;
+    if (offer != null) {
+      inspectPriceSpec(offer['priceSpecification']);
 
-    if (currentPrice <= 0) return null;
+      final offerPrice = _parsePrice(offer['price']);
+      final offerLow = _parsePrice(offer['lowPrice']);
+      final offerHigh = _parsePrice(offer['highPrice']);
 
-    double? specOldPrice;
-    final priceSpec = offer?['priceSpecification'];
-    if (priceSpec is Map &&
-        (priceSpec['priceType'] ?? '').toString().contains('StrikethroughPrice')) {
-      specOldPrice = double.tryParse(
-        (priceSpec['price'] ?? '').toString().replaceAll(',', '.'),
-      );
+      if (offerLow != null && offerLow > 0) {
+        detectedCurrentPrice ??= offerLow;
+        if (offerHigh != null && offerHigh > offerLow) {
+          detectedRegularPrice ??= offerHigh;
+        } else if (offerPrice != null && offerPrice > offerLow) {
+          detectedRegularPrice ??= offerPrice;
+        }
+      } else if (offerPrice != null && offerPrice > 0) {
+        detectedCurrentPrice ??= offerPrice;
+      }
     }
 
-    final regularPrice = (nextProduct?['oldPrice'] as num?)?.toDouble() ??
-        specOldPrice ??
-        currentPrice;
+    // 3. Z meta tagów i Microdata
+    final metaPriceStr = getMeta('product:price:amount') ??
+        getMeta('og:price:amount') ??
+        getItemprop('price');
+    if (metaPriceStr != null) {
+      final mp = double.tryParse(metaPriceStr.replaceAll(',', '.'));
+      if (mp != null && mp > 0) {
+        detectedCurrentPrice ??= mp;
+      }
+    }
 
-    double? lowestOmnibusPrice =
-        (nextProduct?['lastLowestPriceV2'] as num?)?.toDouble();
+    // 4. Z widocznego tekstu strony (odrzuca ceny jednostkowe /100ml, rekomendowane, progi dostawy i kupony)
+    final currPre = detectedCurrentPrice;
+    if ((currPre == null || currPre <= 0) && fallbackText.isNotEmpty) {
+      final priceMatches = RegExp(r'(\d{1,5}[,.]\d{2})\s*(?:zł|PLN)', caseSensitive: false)
+          .allMatches(fallbackText);
+      final badBefore = RegExp(
+        r'(?:jednostkow|rekomendowan|dostawc|dostaw|kupon|rabat|za\s*100|30\s*dni|omnibus|rat|newsletter)',
+        caseSensitive: false,
+      );
+      final badAfter = RegExp(r'^\s*/\s*(?:100|1000|1)?\s*(?:ml|g|l|kg|szt)', caseSensitive: false);
+      for (final m in priceMatches) {
+        final lineStart = fallbackText.lastIndexOf('\n', m.start);
+        final beforeStart = (lineStart >= 0 ? lineStart + 1 : 0).clamp(
+          (m.start - 45).clamp(0, fallbackText.length),
+          m.start,
+        );
+        final beforeCtx = fallbackText.substring(beforeStart, m.start);
+        final lineEnd = fallbackText.indexOf('\n', m.end);
+        final afterEnd = (lineEnd >= 0 ? lineEnd : fallbackText.length).clamp(
+          m.end,
+          (m.end + 20).clamp(0, fallbackText.length),
+        );
+        final afterCtx = fallbackText.substring(m.end, afterEnd);
+        if (badBefore.hasMatch(beforeCtx) || badAfter.hasMatch(afterCtx)) {
+          continue;
+        }
+        final p = double.tryParse(m.group(1)!.replaceAll(',', '.'));
+        if (p != null && p > 0) {
+          detectedCurrentPrice = p;
+          break;
+        }
+      }
+    }
 
+    final currFinal = detectedCurrentPrice;
+    if (currFinal == null || currFinal <= 0) return null;
+
+    final double currentPrice = currFinal;
+    final double regularPrice = (detectedRegularPrice != null && detectedRegularPrice! >= currentPrice)
+        ? detectedRegularPrice!
+        : currentPrice;
+
+    // 5. Najniższa cena z 30 dni (Omnibus)
+    double? lowestOmnibusPrice = detectedOmnibusPrice;
     if (lowestOmnibusPrice == null && fallbackText.isNotEmpty) {
       final omniMatch = RegExp(
-        r'30\s*dni[^0-9]{1,35}(\d{1,5}[,.]\d{2})\s*(?:zł|PLN)',
+        r'(?:najniższa\s*cena|30\s*dni|omnibus)[^0-9]{1,40}(\d{1,5}[,.]\d{2})\s*(?:zł|PLN)',
         caseSensitive: false,
       ).firstMatch(fallbackText);
       if (omniMatch != null) {
-        lowestOmnibusPrice =
-            double.tryParse(omniMatch.group(1)!.replaceAll(',', '.'));
+        lowestOmnibusPrice = double.tryParse(omniMatch.group(1)!.replaceAll(',', '.'));
       }
+    }
+
+    String? cleanImageUrl(dynamic raw) {
+      if (raw == null) return null;
+      String? u;
+      if (raw is String) {
+        u = raw.trim();
+      } else if (raw is Map) {
+        u = (raw['url'] ?? raw['contentUrl'] ?? raw['medium'] ?? raw['large'])?.toString().trim();
+      } else if (raw is List && raw.isNotEmpty) {
+        for (final item in raw) {
+          final candidate = cleanImageUrl(item);
+          if (candidate != null) return candidate;
+        }
+        return null;
+      }
+      if (u == null || u.isEmpty) return null;
+      if (u.startsWith('//')) u = 'https:$u';
+      if (!u.startsWith('http://') && !u.startsWith('https://')) return null;
+      return u;
     }
 
     String? image;
     final pics = nextProduct?['pictures'] ?? nextProduct?['galleryItems'];
     if (pics is List && pics.isNotEmpty && pics.first is Map) {
-      image = (pics.first as Map)['medium']?.toString();
+      image = cleanImageUrl((pics.first as Map)['medium'] ?? (pics.first as Map)['large']);
     }
-    if (image == null) {
-      final ldImg = jsonLdProduct?['image'];
-      if (ldImg is List && ldImg.isNotEmpty) {
-        image = ldImg.first.toString();
-      } else if (ldImg is String) {
-        image = ldImg;
-      } else if (ldImg is Map) {
-        image = ldImg['url']?.toString();
+    image ??= cleanImageUrl(jsonLdProduct?['image']);
+    image ??= cleanImageUrl(getMeta('og:image'));
+    image ??= cleanImageUrl(getMeta('twitter:image'));
+    image ??= cleanImageUrl(fallbackImage);
+    if (image == null && html.isNotEmpty) {
+      // Fallback dla Allegro CDN (a.allegroimg.com) i głównych zdjęć produktów
+      final allegroImg = RegExp(
+        r'https://a\.allegroimg\.com/(?:s\d+|original)/[a-zA-Z0-9/_.-]+',
+        caseSensitive: false,
+      ).firstMatch(html);
+      if (allegroImg != null) {
+        image = allegroImg.group(0);
       }
     }
-    image ??= getMeta('og:image');
-    if ((image == null || image.isEmpty) && fallbackImage.isNotEmpty) {
-      image = fallbackImage;
-    }
+
+    final smartCategory = detectSmartCategory(
+      fullName: fullName,
+      url: url,
+      storeFallbackCategory: storeInfo['category'] ?? 'Sklep',
+      rawLdCategory: jsonLdProduct?['category']?.toString(),
+    );
 
     return ProductInfo(
       store: storeInfo['name'] ?? 'Sklep',
-      category: storeInfo['category'] ?? 'Sklep',
+      category: smartCategory,
       url: url,
       brand: brand.isEmpty ? (storeInfo['name'] ?? 'Sklep') : brand,
       title: rawTitle,
@@ -839,28 +1215,38 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
     final searchKey = validEan ?? nameQuery;
     if (searchKey.isEmpty) return offers;
 
-    final tasks = <Future<List<StoreOffer>>>[
-      if (baseProduct.store != 'Rossmann')
-        _searchRossmann(searchKey, validEan, baseProduct),
-      if (baseProduct.store != 'Drogerie Natura')
-        _searchNatura(searchKey, validEan, baseProduct),
-      if (baseProduct.store != 'Pachnij.pl')
-        _searchPachnij(searchKey, validEan, baseProduct),
-      if (baseProduct.store != 'eZebra')
-        _searchEzebra(searchKey, validEan, baseProduct),
-      if (baseProduct.store != 'Cocolita')
-        _searchCocolita(searchKey, validEan, baseProduct),
-      if (baseProduct.store != 'Apteka Melissa')
-        _searchMelissa(searchKey, validEan, baseProduct),
-      if (geminiApiKey.trim().isNotEmpty)
-        _searchMultiStoresWithGeminiGrounding(
-          apiKey: geminiApiKey.trim(),
-          ean: validEan,
-          baseProduct: baseProduct,
-        ),
-    ];
+    List<Future<List<StoreOffer>>> buildTasks(String key, String? eanForSearch, bool withGemini) {
+      return <Future<List<StoreOffer>>>[
+        if (baseProduct.store != 'Rossmann')
+          _searchRossmann(key, eanForSearch, baseProduct),
+        if (baseProduct.store != 'Drogerie Natura')
+          _searchNatura(key, eanForSearch, baseProduct),
+        if (baseProduct.store != 'Pachnij.pl')
+          _searchPachnij(key, eanForSearch, baseProduct),
+        if (baseProduct.store != 'eZebra')
+          _searchEzebra(key, eanForSearch, baseProduct),
+        if (baseProduct.store != 'Cocolita')
+          _searchCocolita(key, eanForSearch, baseProduct),
+        if (baseProduct.store != 'Apteka Melissa')
+          _searchMelissa(key, eanForSearch, baseProduct),
+        if (withGemini && geminiApiKey.trim().isNotEmpty)
+          _searchMultiStoresWithGeminiGrounding(
+            apiKey: geminiApiKey.trim(),
+            ean: validEan,
+            baseProduct: baseProduct,
+          ),
+      ];
+    }
 
-    final results = await Future.wait(tasks);
+    var results = await Future.wait(buildTasks(searchKey, validEan, true));
+
+    // Jeśli wyszukiwanie po EAN nic nie dało (np. EAN odczytany ze strony był błędny
+    // i został odrzucony przez kontrolę nazwy), próbujemy jeszcze raz po samej nazwie.
+    final foundAny = results.any((l) => l.any((o) => o.price > 0));
+    if (!foundAny && validEan != null && nameQuery.isNotEmpty) {
+      results = await Future.wait(buildTasks(nameQuery, null, false));
+    }
+
     for (final list in results) {
       for (final found in list) {
         if (found.price <= 0) continue;
@@ -893,7 +1279,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       for (final match in matches) {
         final rossUrl = 'https://www.rossmann.pl${match.group(0)}';
         final rossHtml = await _fetchHtml(rossUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: rossHtml,
           url: rossUrl,
           storeInfo: {'name': 'Rossmann', 'category': 'Drogeria'},
@@ -969,7 +1355,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
         }
 
         final natHtml = await _fetchHtml(natUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: natHtml,
           url: natUrl,
           storeInfo: {'name': 'Drogerie Natura', 'category': 'Drogeria'},
@@ -1016,7 +1402,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       for (final m in matches) {
         final prodUrl = m.group(0)!;
         final prodHtml = await _fetchHtml(prodUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: prodHtml,
           url: prodUrl,
           storeInfo: {'name': 'Pachnij.pl', 'category': 'Drogeria'},
@@ -1063,7 +1449,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       for (final prodMatch in matches) {
         final prodUrl = prodMatch.group(0)!;
         final prodHtml = await _fetchHtml(prodUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: prodHtml,
           url: prodUrl,
           storeInfo: {'name': 'eZebra', 'category': 'Drogeria'},
@@ -1114,7 +1500,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
         seen.add(prodUrl);
 
         final prodHtml = await _fetchHtml(prodUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: prodHtml,
           url: prodUrl,
           storeInfo: {'name': 'Cocolita', 'category': 'Drogeria'},
@@ -1161,7 +1547,7 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       for (final prodMatch in matches) {
         final prodUrl = prodMatch.group(0)!;
         final prodHtml = await _fetchHtml(prodUrl);
-        final parsed = _parseHtmlDocument(
+        final parsed = parseHtmlDocument(
           html: prodHtml,
           url: prodUrl,
           storeInfo: {'name': 'Apteka Melissa', 'category': 'Apteka'},
@@ -1190,6 +1576,19 @@ ${innerText.length > 6000 ? innerText.substring(0, 6000) : innerText}
       }
     } catch (_) {}
     return [];
+  }
+
+  /// Czy host URL pasuje do nazwy sklepu (dla znanych sklepów); dla nieznanych akceptujemy.
+  static bool _urlMatchesStore(String url, String storeName) {
+    final detected = detectStore(url)['name'] ?? '';
+    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    if (host.isEmpty) return false;
+    final want = _normalizeText(storeName).replaceAll(' ', '');
+    final got = _normalizeText(detected).replaceAll(' ', '');
+    final hostFlat = host.replaceAll(RegExp(r'[^a-z0-9]'), '');
+    if (got.isNotEmpty && (got.contains(want) || want.contains(got))) return true;
+    // Nazwa sklepu w hoście (np. "Cosibella" -> cosibella.pl)
+    return want.length >= 4 && hostFlat.contains(want);
   }
 
   static Future<List<StoreOffer>> _searchMultiStoresWithGeminiGrounding({
@@ -1265,35 +1664,41 @@ BARDZO WAŻNE:
       for (final item in list) {
         if (item is! Map) continue;
         final store = (item['store'] ?? '').toString().trim();
-        final prodName = (item['productName'] ?? baseProduct.fullName).toString().trim();
-        final price = (item['price'] as num?)?.toDouble() ??
-            double.tryParse((item['price'] ?? '').toString().replaceAll(',', '.')) ??
-            0.0;
-        if (store.isEmpty || price <= 0) continue;
+        final prodName = (item['productName'] ?? '').toString().trim();
+        final price = _parsePrice(item['price']) ?? 0.0;
+        if (store.isEmpty || prodName.isEmpty || price <= 0) continue;
 
-        // Weryfikujemy czy zwrócona przez AI oferta na pewno dotyczy tej samej marki/produktu
+        // Weryfikujemy czy zwrócona przez AI oferta na pewno dotyczy dokładnie tego samego produktu i marki!
         final candidateCheck = ProductInfo(
           store: store,
           category: baseProduct.category,
           url: '',
-          brand: baseProduct.brand,
+          brand: '', // Nie wpisujemy marki na sztywno, kandydat musi sam zawierać markę!
           title: prodName,
           fullName: prodName,
-          unit: '',
+          unit: _extractCapacity(prodName, '') ?? '',
           currentPrice: price,
           regularPrice: price,
           isPromo: false,
           availability: '',
           checkedAt: '',
         );
+        // Oferty z wyszukiwarki AI nie mają kodu EAN ani HTML, więc weryfikujemy je po nazwie.
         if (!isSameProduct(baseProduct: baseProduct, candidate: candidateCheck)) {
           continue;
         }
 
-        final regPrice = (item['regularPrice'] as num?)?.toDouble() ??
-            double.tryParse((item['regularPrice'] ?? '').toString().replaceAll(',', '.')) ??
-            price;
-        final url = (item['url'] ?? '').toString().trim();
+        final regPrice = _parsePrice(item['regularPrice']) ?? price;
+        final rawUrl = (item['url'] ?? '').toString().trim();
+        // Link musi prowadzić do domeny deklarowanego sklepu (AI potrafi podać link do innego sklepu/produktu).
+        final isValidDirectUrl = rawUrl.startsWith('http') &&
+            !rawUrl.contains('google.com/search') &&
+            rawUrl.split('/').length > 3 &&
+            _urlMatchesStore(rawUrl, store);
+
+        final finalUrl = isValidDirectUrl
+            ? rawUrl
+            : 'https://www.google.com/search?q=${Uri.encodeComponent("${baseProduct.fullName} ${ean ?? ""} $store")}';
 
         foundOffers.add(
           StoreOffer(
@@ -1301,9 +1706,7 @@ BARDZO WAŻNE:
             price: price,
             regularPrice: regPrice >= price ? regPrice : price,
             isPromo: regPrice > price,
-            url: url.startsWith('http')
-                ? url
-                : 'https://www.google.com/search?q=${Uri.encodeComponent("${baseProduct.fullName} ${ean ?? ""} $store")}',
+            url: finalUrl,
             availability: 'Znaleziono (Agent AI)',
             isOrigin: false,
           ),

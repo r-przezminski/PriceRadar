@@ -20,7 +20,14 @@ Mobilna aplikacja na Androida (**Flutter / Dart + Kotlin Native**) do śledzenia
 3. **Weryfikacja Kodów EAN-13 i Dopasowania Produktów (`isSameProduct`):**
    - Walidator cyfry kontrolnej GS1 modulo-10 (`isValidEan13`) odrzuca fałszywe 13-cyfrowe numery ID i timestampy.
    - Funkcja `extractVerifiedEanFromContent` czyści tagi HTML (np. `<div class="col-12">`) przed szukaniem `Kod EAN: ...` i skanuje obiekty `dataLayer`.
-   - Funkcja `isSameProduct` rygorystycznie weryfikuje oferty z innych sklepów po kodzie EAN, marce, słowach kluczowych (>= 50% pokrycia) oraz pojemności (`ml`/`g`), odrzucając przypadkowe boksy „Bestsellery / Promocja dnia" (np. *Plusssz Magnez* zamiast *Beauty of Joseon*).
+   - Funkcja `isSameProduct` rygorystycznie weryfikuje oferty z innych sklepów po kodzie EAN, marce, unikalnych słowach modelu/wariantu (odseparowanych od marki, aby nie dopasowywać innych kosmetyków tej samej marki!), zgodności numerów wariantu (np. SPF 50 vs SPF 30) oraz pojemności (`ml`/`g`), odrzucając przypadkowe boksy „Bestsellery / Promocja dnia" (np. *Plusssz Magnez* zamiast *Beauty of Joseon*).
+5. **Obsługa Udostępniania z Zewnętrznych Aplikacji (`ACTION_SEND`):**
+   - Dodano intent-filter `ACTION_SEND` (`text/plain` i `text/*`) w `AndroidManifest.xml`.
+   - Funkcja `NativeBridge.extractOnlyUrl` czyści udostępniony lub wklejony tekst, wyciągając wyłącznie czysty URL i obcinając końcowe znaki interpunkcyjne.
+   - Zaraz po udostępnieniu linku (z Chrome, apki Rossmann, Hebe itp.), aplikacja automatycznie uruchamia wyszukiwanie i dodawanie produktu.
+6. **Zdalna Dystrybucja i Stały Keystore Projektu:**
+   - Klucz podpisywania został na stałe powiązany w `android/app/build.gradle.kts` (`android/app/debug.keystore`), eliminując problem niezgodności sygnatur (`INSTALL_FAILED_UPDATE_INCOMPATIBLE`) między różnymi komputerami.
+   - Obsługa bezprzewodowego wdrażania na wiele telefonów jednocześnie przez `adb` po Wi-Fi (np. Armor 27T Pro + Pixel 10a).
 4. **Sprawdzanie Cen w Tle co 2 Godziny (`PriceCheckWorker` w `MainActivity.kt`):**
    - Natywny Android `WorkManager` (`PeriodicWorkRequest` co 2 godziny) sprawdza ceny wszystkich obserwowanych produktów nawet przy całkowicie zamkniętej aplikacji i uśpionym telefonie (obsługuje zarówno szybki HTTP, jak i `OffscreenWebViewCapturer` + Gemini API w tle) i wysyła natywne powiadomienia systemowe Androida (`NotificationManager`), gdy cena spadnie.
    - W `android/app/build.gradle.kts` minifikacja R8 jest wyłączona (`isMinifyEnabled = false`), aby R8 nie zaciemniał klasy `androidx.work.impl.WorkDatabase_Impl`.
